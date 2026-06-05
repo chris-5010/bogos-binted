@@ -26,135 +26,22 @@ static double now_s() {
 //   [8..9]  best_index lo/hi
 #define RSTRIDE 10
 
-static const char *GLSL = R"GLSL(
-#version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-layout(local_size_x = BLOCK_SIZE) in;
-
-layout(push_constant) uniform PC {
-    uint seed_lo, seed_hi, batch_per_item, index_lo, index_hi;
-} pc;
-
-layout(set=0, binding=0) buffer R { uint data[]; } res;
-
-uint64_t sm64(uint64_t z) {
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9UL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebUL;
-    return z ^ (z >> 31);
-}
-
-uint rotl(uint x, uint k) { return (x << k) | (x >> (32u-k)); }
-
-struct X { uint s0,s1,s2,s3; };
-
-uint step(inout X s) {
-    uint r = rotl(s.s0+s.s3,7u)+s.s0, t=s.s1<<9u;
-    s.s2^=s.s0; s.s3^=s.s1; s.s1^=s.s2; s.s0^=s.s3; s.s2^=t; s.s3=rotl(s.s3,11u);
-    return r;
-}
-
-uint bounded(inout X s, uint m) {
-    uint thr=uint(uint64_t(0x100000000UL)%uint64_t(m)), x;
-    do { x=step(s); } while(x<thr);
-    return x%m;
-}
-
-void main() {
-    const uint64_t C = 0x9e3779b97f4a7c15UL;
-    uint gid = gl_GlobalInvocationID.x;
-    uint64_t seed = (uint64_t(pc.seed_hi)<<32u)|uint64_t(pc.seed_lo);
-    uint64_t base = ((uint64_t(pc.index_hi)<<32u)|uint64_t(pc.index_lo))
-                  + uint64_t(gid)*uint64_t(pc.batch_per_item);
-
-    uint64_t z=seed+base*C+C, ha=sm64(z); z+=C;
-    uint64_t hb=sm64(z); z+=C;
-
-    int best=-1; uint biter=0u, barr[25];
-
-    for (uint iter=0u; iter<pc.batch_per_item; ++iter) {
-        X s; s.s0=uint(ha); s.s1=uint(ha>>32u); s.s2=uint(hb); s.s3=uint(hb>>32u);
-        if ((s.s0|s.s1|s.s2|s.s3)==0u) s.s0=1u;
-
-        uint arr[25];
-        for (uint i=0u;i<25u;++i) arr[i]=i+1u;
-
-        uint j;
-        j=bounded(s,25u);{uint t=arr[24];arr[24]=arr[j];arr[j]=t;}
-        j=bounded(s,24u);{uint t=arr[23];arr[23]=arr[j];arr[j]=t;}
-        j=bounded(s,23u);{uint t=arr[22];arr[22]=arr[j];arr[j]=t;}
-        j=bounded(s,22u);{uint t=arr[21];arr[21]=arr[j];arr[j]=t;}
-        j=bounded(s,21u);{uint t=arr[20];arr[20]=arr[j];arr[j]=t;}
-        j=bounded(s,20u);{uint t=arr[19];arr[19]=arr[j];arr[j]=t;}
-        j=bounded(s,19u);{uint t=arr[18];arr[18]=arr[j];arr[j]=t;}
-        j=bounded(s,18u);{uint t=arr[17];arr[17]=arr[j];arr[j]=t;}
-        j=bounded(s,17u);{uint t=arr[16];arr[16]=arr[j];arr[j]=t;}
-        j=bounded(s,16u);{uint t=arr[15];arr[15]=arr[j];arr[j]=t;}
-        j=bounded(s,15u);{uint t=arr[14];arr[14]=arr[j];arr[j]=t;}
-        j=bounded(s,14u);{uint t=arr[13];arr[13]=arr[j];arr[j]=t;}
-        j=bounded(s,13u);{uint t=arr[12];arr[12]=arr[j];arr[j]=t;}
-        j=bounded(s,12u);{uint t=arr[11];arr[11]=arr[j];arr[j]=t;}
-        j=bounded(s,11u);{uint t=arr[10];arr[10]=arr[j];arr[j]=t;}
-        j=bounded(s,10u);{uint t=arr[ 9];arr[ 9]=arr[j];arr[j]=t;}
-        j=bounded(s, 9u);{uint t=arr[ 8];arr[ 8]=arr[j];arr[j]=t;}
-        j=bounded(s, 8u);{uint t=arr[ 7];arr[ 7]=arr[j];arr[j]=t;}
-        j=bounded(s, 7u);{uint t=arr[ 6];arr[ 6]=arr[j];arr[j]=t;}
-        j=bounded(s, 6u);{uint t=arr[ 5];arr[ 5]=arr[j];arr[j]=t;}
-        j=bounded(s, 5u);{uint t=arr[ 4];arr[ 4]=arr[j];arr[j]=t;}
-        j=bounded(s, 4u);{uint t=arr[ 3];arr[ 3]=arr[j];arr[j]=t;}
-        j=bounded(s, 3u);{uint t=arr[ 2];arr[ 2]=arr[j];arr[j]=t;}
-        j=bounded(s, 2u);{uint t=arr[ 1];arr[ 1]=arr[j];arr[j]=t;}
-
-        int c=0;
-        for (uint i=0u;i<25u;++i) c+=int(arr[i]==i+1u);
-
-        if (c>best) {
-            best=c; biter=iter;
-            for (uint i=0u;i<25u;++i) barr[i]=arr[i];
-            if (c==25) break;
-        }
-        ha=hb; hb=sm64(z); z+=C;
-    }
-
-    uint64_t bidx=base+uint64_t(biter);
-    uint bo=gid*uint(RSTRIDE);
-    res.data[bo]=best<0?0xFFFFFFFFu:uint(best);
-    for (uint w=0u;w<7u;++w) {
-        uint v=0u;
-        for (uint b=0u;b<4u;++b) { uint i=w*4u+b; if(i<25u) v|=(barr[i]&0xFFu)<<(b*8u); }
-        res.data[bo+1u+w]=v;
-    }
-    res.data[bo+8u]=uint(bidx&0xFFFFFFFFUL);
-    res.data[bo+9u]=uint(bidx>>32u);
-}
-)GLSL";
-
-static std::vector<uint32_t> compile_shader(int bs) {
-    FILE *f = fopen("/tmp/bogo.comp","w"); fputs(GLSL,f); fclose(f);
-    char cmd[256];
-    snprintf(cmd,sizeof(cmd),
+static std::vector<uint32_t> compile_shader(const char *path, int bs) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
         "glslangValidator -V --target-env vulkan1.2 -DBLOCK_SIZE=%d "
-        "-DRESULT_STRIDE=%d /tmp/bogo.comp -o /tmp/bogo.spv 2>&1", bs, RSTRIDE);
-    FILE *p=popen(cmd,"r");
-    char buf[2048]={}; fread(buf,1,sizeof(buf)-1,p);
-    if (pclose(p)) { fprintf(stderr,"glslang: %s\n",buf); exit(1); }
-    std::ifstream spv("/tmp/bogo.spv",std::ios::binary|std::ios::ate);
-    size_t n=spv.tellg(); spv.seekg(0);
-    std::vector<uint32_t> c(n/4); spv.read((char*)c.data(),n);
+        "-DRESULT_STRIDE=%d %s -o /tmp/bogo.spv 2>&1", bs, RSTRIDE, path);
+    FILE *p = popen(cmd, "r");
+    char buf[2048] = {}; fread(buf, 1, sizeof(buf)-1, p);
+    if (pclose(p)) { fprintf(stderr, "glslang: %s\n", buf); exit(1); }
+    std::ifstream spv("/tmp/bogo.spv", std::ios::binary | std::ios::ate);
+    size_t n = spv.tellg(); spv.seekg(0);
+    std::vector<uint32_t> c(n/4); spv.read((char*)c.data(), n);
     return c;
 }
 
-struct Ctx {
-    VkInstance inst; VkPhysicalDevice pdev; VkDevice dev; VkQueue q;
-    uint32_t qfam;
-    VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe;
-    VkDescriptorPool dpool; VkDescriptorSet ds;
-    VkBuffer buf; VkDeviceMemory mem;
-    VkCommandPool cpool; VkCommandBuffer cb; VkFence fence;
-    size_t n; int bs;
-    uint32_t *mapped;
-};
 
-static void setup(Ctx &c, size_t n, int bs) {
+static void setup(Ctx &c, size_t n, int bs, const char *shader) {
     c.n=n; c.bs=bs;
 
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -194,7 +81,7 @@ static void setup(Ctx &c, size_t n, int bs) {
     VK_CHECK(vkCreateDevice(c.pdev,&dci,nullptr,&c.dev));
     vkGetDeviceQueue(c.dev,c.qfam,0,&c.q);
 
-    auto spv=compile_shader(bs);
+    auto spv=compile_shader(shader, bs);
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize=spv.size()*4; smi.pCode=spv.data();
     VkShaderModule sm; VK_CHECK(vkCreateShaderModule(c.dev,&smi,nullptr,&sm));
@@ -326,7 +213,17 @@ int main(int argc, char **argv) {
     }
     n=((n+bs-1)/bs)*bs;
 
-    Ctx c; setup(c,n,bs);
+    // look for bogo.comp next to the binary, then current dir
+    char shader_path[512] = "bogo.comp";
+    if (argc > 0) {
+        std::string bin = argv[0];
+        auto slash = bin.rfind('/');
+        if (slash != std::string::npos)
+            snprintf(shader_path, sizeof(shader_path), "%s/bogo.comp",
+                     bin.substr(0, slash).c_str());
+    }
+
+    Ctx c; setup(c, n, bs, shader_path);
     if (dm) { daemon(c); return 0; }
 
     uint32_t slo=pos.size()>0?(uint32_t)std::stoull(pos[0]):0x12345678u;

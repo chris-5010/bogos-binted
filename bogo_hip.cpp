@@ -1,30 +1,10 @@
-/*
- * bogo_hip.cpp — HIP-native bogosort compute engine for AMD GPUs (ROCm)
- *
- * Same seeding/shuffle logic as bogo_gpu.cpp (OpenCL) — fully verifiable
- * by the server. HIP compiles directly to RDNA ISA, no OpenCL translation.
- *
- * Build:
- *   hipcc -O3 -std=c++17 bogo_hip.cpp -o bogo_hip
- *
- * Two modes:
- *
- *   One-shot:
- *     ./bogo_hip [seed_lo] [seed_hi] [total] [work_items] [index_offset]
- *
- *   Daemon (persistent — use this with bogo_bridge.py --binary ./bogo_hip):
- *     ./bogo_hip --daemon [--work-items N] [--block-size N]
- *     Reads "seed_lo seed_hi batch index_offset\n" from stdin.
- *     Writes one JSON result line to stdout per request.
- *     Send "quit\n" to exit.
- *
- * Tuning for 7900 XTX (gfx1100, 96 CUs):
- *   --work-items 655360  --block-size 256   (default)
- *   Try 1310720 / 512 for higher occupancy if temps allow.
- */
+// bogo_hip2.cpp - HIP bogosort daemon for AMD Instinct (MI300X, MI355X)
+// build: hipcc -O3 -std=c++17 --offload-arch=gfx942 bogo_hip2.cpp -o bogo_hip2
+//        (check your arch: rocminfo | grep -o 'gfx[0-9]*' | grep -v gfx0 | head -1)
+// daemon: echo "seed_lo seed_hi batch offset" | ./bogo_hip2 --daemon [--work-items N]
+// note: wave64 on CDNA, so block sizes should be multiples of 64
 
 #include <hip/hip_runtime.h>
-
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -32,327 +12,235 @@
 #include <string>
 #include <vector>
 
-#define HIP_CHECK(expr)                                                     \
-    do {                                                                     \
-        hipError_t _e = (expr);                                              \
-        if (_e != hipSuccess) {                                              \
-            fprintf(stderr, "HIP error %s at %s:%d\n",                      \
-                    hipGetErrorString(_e), __FILE__, __LINE__);              \
-            std::exit(1);                                                    \
-        }                                                                    \
-    } while (0)
+#define HIP_CHECK(e) do { hipError_t _r=(e); if(_r!=hipSuccess){ \
+    fprintf(stderr,"HIP error %s at %s:%d\n",hipGetErrorString(_r),__FILE__,__LINE__); \
+    exit(1);} } while(0)
 
 static double now_s() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-// ── Device-side RNG (identical to JS worker + OpenCL kernel) ─────────────
-
-struct Xo128State { uint32_t s[4]; };
-
-__device__ __forceinline__ Xo128State xo_seed(uint64_t si) {
-    uint64_t z, a, b;
-    z = si + 0x9e3779b97f4a7c15ULL;
+// chained seeding (1 hash/shuffle instead of 2), unrolled FY + scoring,
+// best_arr in registers, uint8_t arrays (native on CDNA)
+__device__ static __forceinline__ uint64_t sm64(uint64_t z) {
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    a = z ^ (z >> 31);
-    z = si + 2ULL * 0x9e3779b97f4a7c15ULL;
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    b = z ^ (z >> 31);
-    Xo128State st;
-    st.s[0] = (uint32_t)(a & 0xffffffffULL); st.s[1] = (uint32_t)(a >> 32);
-    st.s[2] = (uint32_t)(b & 0xffffffffULL); st.s[3] = (uint32_t)(b >> 32);
-    if (!st.s[0] && !st.s[1] && !st.s[2] && !st.s[3]) st.s[0] = 1;
-    return st;
+    return z ^ (z >> 31);
 }
 
-__device__ __forceinline__ uint32_t rotl32(uint32_t x, uint32_t k) {
+__device__ static __forceinline__ uint32_t rotl32(uint32_t x, uint32_t k) {
     return (x << k) | (x >> (32u - k));
 }
 
-__device__ __forceinline__ uint32_t xo_next(Xo128State *st) {
-    uint32_t res = rotl32(st->s[0] + st->s[3], 7u) + st->s[0];
-    uint32_t t   = st->s[1] << 9u;
-    st->s[2] ^= st->s[0]; st->s[3] ^= st->s[1];
-    st->s[1] ^= st->s[2]; st->s[0] ^= st->s[3];
-    st->s[2] ^= t; st->s[3] = rotl32(st->s[3], 11u);
+struct Xo128 { uint32_t s0, s1, s2, s3; };
+
+__device__ static __forceinline__ uint32_t xnext(Xo128 &st) {
+    uint32_t res = rotl32(st.s0 + st.s3, 7u) + st.s0;
+    uint32_t t   = st.s1 << 9u;
+    st.s2 ^= st.s0; st.s3 ^= st.s1;
+    st.s1 ^= st.s2; st.s0 ^= st.s3;
+    st.s2 ^= t; st.s3 = rotl32(st.s3, 11u);
     return res;
 }
 
-__device__ __forceinline__ uint32_t xo_uint(Xo128State *st, uint32_t max) {
-    // Rejection sampling — matches JS xint() exactly (required for server verify)
-    uint32_t threshold = (uint32_t)(0x100000000ULL % (uint64_t)max);
-    uint32_t x;
-    do { x = xo_next(st); } while (x < threshold);
-    return x % max;
-}
+// compile-time constant max → compiler replaces % with multiply-shift
+#define XU(st,m) ({ \
+    uint32_t _thr=(uint32_t)(0x100000000ULL%(uint64_t)(m)); \
+    uint32_t _x; do{_x=xnext(st);}while(_x<_thr); \
+    _x%(m); })
 
-// ── Kernel ────────────────────────────────────────────────────────────────
-// Result layout per thread: 35 bytes
-//   [0]      best_correct (0xFF = no result)
-//   [1..25]  best_arr
-//   [26..33] best_index (little-endian u64)
-//   [34]     padding
+// pre-capture index to avoid evaluating XU twice (it advances RNG state)
+#define FY(st,arr,i,m) { uint32_t _j=XU(st,m); \
+    uint8_t _t=arr[i]; arr[i]=arr[_j]; arr[_j]=_t; }
+
+// Per work-item result: 35 bytes = [0]=score, [1..25]=arr, [26..33]=index_le64, [34]=pad
+#define STRIDE 35
 
 __global__ void bogosort_batch(
     uint32_t seed_lo, uint32_t seed_hi,
     uint32_t batch_per_item, uint64_t index_offset,
     uint8_t * __restrict__ results
 ) {
-    const int N = 25;
-    uint64_t gid     = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t seed64  = ((uint64_t)seed_hi << 32) | (uint64_t)seed_lo;
+    const uint64_t C    = 0x9e3779b97f4a7c15ULL;
+    uint32_t gid        = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t seed64     = ((uint64_t)seed_hi << 32) | (uint64_t)seed_lo;
+    uint64_t base       = index_offset + (uint64_t)gid * (uint64_t)batch_per_item;
+
+    // Chained seeding
+    uint64_t z  = seed64 + base * C + C;
+    uint64_t ha = sm64(z); z += C;
+    uint64_t hb = sm64(z); z += C;
 
     int      best_correct = -1;
     uint8_t  best_arr[25];
-    uint64_t best_index   = 0;
+    uint32_t best_iter    = 0;
 
-    #pragma unroll 1
-    for (uint32_t iter = 0; iter < batch_per_item; iter++) {
-        uint64_t global_index = index_offset + gid * (uint64_t)batch_per_item + iter;
-        uint64_t si = seed64 + global_index * 0x9e3779b97f4a7c15ULL;
-
-        Xo128State st = xo_seed(si);
+    for (uint32_t iter = 0; iter < batch_per_item; ++iter) {
+        Xo128 st;
+        st.s0 = (uint32_t)ha;        st.s1 = (uint32_t)(ha >> 32);
+        st.s2 = (uint32_t)hb;        st.s3 = (uint32_t)(hb >> 32);
+        if (!(st.s0 | st.s1 | st.s2 | st.s3)) st.s0 = 1;
 
         uint8_t arr[25];
-        #pragma unroll
-        for (int i = 0; i < N; i++) arr[i] = (uint8_t)(i + 1);
+        arr[ 0]= 1; arr[ 1]= 2; arr[ 2]= 3; arr[ 3]= 4; arr[ 4]= 5;
+        arr[ 5]= 6; arr[ 6]= 7; arr[ 7]= 8; arr[ 8]= 9; arr[ 9]=10;
+        arr[10]=11; arr[11]=12; arr[12]=13; arr[13]=14; arr[14]=15;
+        arr[15]=16; arr[16]=17; arr[17]=18; arr[18]=19; arr[19]=20;
+        arr[20]=21; arr[21]=22; arr[22]=23; arr[23]=24; arr[24]=25;
 
-        // Fisher-Yates — must match JS/WASM exactly
-        #pragma unroll 1
-        for (int i = N - 1; i > 0; i--) {
-            uint32_t j = xo_uint(&st, (uint32_t)(i + 1));
-            uint8_t tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
-        }
+        // Fully unrolled Fisher-Yates
+        FY(st,arr,24,25) FY(st,arr,23,24) FY(st,arr,22,23) FY(st,arr,21,22)
+        FY(st,arr,20,21) FY(st,arr,19,20) FY(st,arr,18,19) FY(st,arr,17,18)
+        FY(st,arr,16,17) FY(st,arr,15,16) FY(st,arr,14,15) FY(st,arr,13,14)
+        FY(st,arr,12,13) FY(st,arr,11,12) FY(st,arr,10,11) FY(st,arr, 9,10)
+        FY(st,arr, 8, 9) FY(st,arr, 7, 8) FY(st,arr, 6, 7) FY(st,arr, 5, 6)
+        FY(st,arr, 4, 5) FY(st,arr, 3, 4) FY(st,arr, 2, 3) FY(st,arr, 1, 2)
 
-        int correct = 0;
-        #pragma unroll
-        for (int i = 0; i < N; i++) if (arr[i] == (uint8_t)(i + 1)) correct++;
+        int correct =
+            (arr[ 0]== 1)+(arr[ 1]== 2)+(arr[ 2]== 3)+(arr[ 3]== 4)+(arr[ 4]== 5)+
+            (arr[ 5]== 6)+(arr[ 6]== 7)+(arr[ 7]== 8)+(arr[ 8]== 9)+(arr[ 9]==10)+
+            (arr[10]==11)+(arr[11]==12)+(arr[12]==13)+(arr[13]==14)+(arr[14]==15)+
+            (arr[15]==16)+(arr[16]==17)+(arr[17]==18)+(arr[18]==19)+(arr[19]==20)+
+            (arr[20]==21)+(arr[21]==22)+(arr[22]==23)+(arr[23]==24)+(arr[24]==25);
 
         if (correct > best_correct) {
             best_correct = correct;
-            best_index   = global_index;
-            #pragma unroll
-            for (int i = 0; i < N; i++) best_arr[i] = arr[i];
-            if (correct == N) break;
+            best_iter    = iter;
+            for (int k = 0; k < 25; ++k) best_arr[k] = arr[k];
+            if (correct == 25) break;
         }
+
+        ha = hb;
+        hb = sm64(z);
+        z += C;
     }
 
-    uint64_t base = gid * 35;
-    results[base] = (best_correct < 0) ? 0xFF : (uint8_t)best_correct;
-    #pragma unroll
-    for (int i = 0; i < 25; i++) results[base + 1 + i] = best_arr[i];
-    #pragma unroll
-    for (int i = 0; i < 8; i++)
-        results[base + 26 + i] = (uint8_t)((best_index >> (8 * i)) & 0xff);
-    results[base + 34] = 0;
+    uint64_t best_index = base + (uint64_t)best_iter;
+    uint64_t base_out   = (uint64_t)gid * STRIDE;
+    results[base_out] = (best_correct < 0) ? 0xFF : (uint8_t)best_correct;
+    for (int k = 0; k < 25; ++k) results[base_out + 1 + k] = best_arr[k];
+    for (int k = 0; k < 8;  ++k)
+        results[base_out + 26 + k] = (uint8_t)((best_index >> (8*k)) & 0xff);
+    results[base_out + 34] = 0;
 }
 
-// ── GPU state (kept alive across daemon dispatches) ───────────────────────
+struct BatchResult { int best_correct; uint8_t best_arr[25]; uint64_t best_index; };
 
-struct GpuState {
-    uint8_t *d_results = nullptr;   // device result buffer
-    uint8_t *h_results = nullptr;   // pinned host result buffer (fast DMA)
+struct GpuCtx {
+    uint8_t *dev_results = nullptr;
+    uint8_t *host_results = nullptr;
     size_t   work_items  = 0;
     int      block_size  = 256;
-    bool     unified     = false;
 };
 
-static void init_gpu(GpuState &g, size_t work_items, int block_size) {
-    g.work_items = work_items;
-    g.block_size = block_size;
+static void init_gpu(GpuCtx &ctx, size_t work_items, int block_size) {
+    ctx.work_items = work_items;
+    ctx.block_size = block_size;
+
+    int dev = 0;
+    HIP_CHECK(hipSetDevice(dev));
 
     hipDeviceProp_t prop;
-    HIP_CHECK(hipGetDeviceProperties(&prop, 0));
-    g.unified = prop.unifiedAddressing && (prop.totalGlobalMem == 0 ||
-                strstr(prop.name, "Radeon RX") == nullptr);
-    fprintf(stderr, "[hip] device:   %s\n", prop.name);
-    fprintf(stderr, "[hip] unified:  %s\n", g.unified ? "yes (iGPU)" : "no (discrete)");
-    fprintf(stderr, "[hip] CUs:      %d\n", prop.multiProcessorCount);
+    HIP_CHECK(hipGetDeviceProperties(&prop, dev));
+    fprintf(stderr, "[hip] device:  %s\n", prop.name);
+    fprintf(stderr, "[hip] CUs:     %d\n", prop.multiProcessorCount);
 
-    size_t buf = work_items * 35;
-    HIP_CHECK(hipMalloc(&g.d_results, buf));
-    // Pinned host memory for fast DMA transfer
-    HIP_CHECK(hipHostMalloc(&g.h_results, buf, hipHostMallocDefault));
+    size_t buf = work_items * STRIDE;
+    HIP_CHECK(hipMalloc(&ctx.dev_results, buf));
+    HIP_CHECK(hipHostMalloc(&ctx.host_results, buf, hipHostMallocDefault));
+    HIP_CHECK(hipMemset(ctx.dev_results, 0xFF, buf));
 }
 
-static void destroy_gpu(GpuState &g) {
-    if (g.d_results) hipFree(g.d_results);
-    if (g.h_results) hipHostFree(g.h_results);
-}
-
-// ── One dispatch ──────────────────────────────────────────────────────────
-
-struct BatchResult {
-    int      best_correct;
-    uint8_t  best_arr[25];
-    uint64_t best_index;
-};
-
-static BatchResult run_dispatch(GpuState &g,
+static BatchResult run_dispatch(GpuCtx &ctx,
                                 uint32_t seed_lo, uint32_t seed_hi,
                                 uint32_t batch_per_item, uint64_t index_offset) {
-    int   grid = (int)((g.work_items + g.block_size - 1) / g.block_size);
-
-    bogosort_batch<<<grid, g.block_size>>>(
-        seed_lo, seed_hi, batch_per_item, index_offset, g.d_results);
-
-    // Copy results back via pinned memory (async-then-sync for overlap)
-    HIP_CHECK(hipMemcpy(g.h_results, g.d_results,
-                        g.work_items * 35, hipMemcpyDeviceToHost));
+    uint32_t blocks = (uint32_t)((ctx.work_items + ctx.block_size - 1) / ctx.block_size);
+    bogosort_batch<<<blocks, ctx.block_size>>>(
+        seed_lo, seed_hi, batch_per_item, index_offset, ctx.dev_results);
+    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipMemcpy(ctx.host_results, ctx.dev_results,
+                        ctx.work_items * STRIDE, hipMemcpyDeviceToHost));
 
     BatchResult best; best.best_correct = -1; best.best_index = 0;
     memset(best.best_arr, 0, 25);
-
-    for (size_t i = 0; i < g.work_items; i++) {
-        uint8_t sb = g.h_results[i * 35];
+    for (size_t i = 0; i < ctx.work_items; ++i) {
+        uint8_t sb = ctx.host_results[i * STRIDE];
         if (sb == 0xFF) continue;
         int c = (int)sb;
         if (c > best.best_correct) {
             best.best_correct = c;
-            memcpy(best.best_arr, &g.h_results[i * 35 + 1], 25);
+            memcpy(best.best_arr, ctx.host_results + i*STRIDE + 1, 25);
             uint64_t idx = 0;
-            for (int b = 0; b < 8; b++)
-                idx |= (uint64_t)g.h_results[i * 35 + 26 + b] << (8 * b);
+            for (int b = 0; b < 8; ++b)
+                idx |= (uint64_t)ctx.host_results[i*STRIDE+26+b] << (8*b);
             best.best_index = idx;
         }
     }
     return best;
 }
 
-// ── Daemon loop ───────────────────────────────────────────────────────────
-
-static void daemon_loop(GpuState &g) {
+static void daemon_loop(GpuCtx &ctx) {
     fprintf(stderr, "[hip-daemon] ready  work_items=%zu  block_size=%d\n",
-            g.work_items, g.block_size);
+            ctx.work_items, ctx.block_size);
     fflush(stderr);
-
     char line[512];
     while (fgets(line, sizeof(line), stdin)) {
         size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
-        if (strncmp(line, "quit", 4) == 0) break;
-
-        unsigned long long sl, sh, batch_req, offset;
-        if (sscanf(line, "%llu %llu %llu %llu", &sl, &sh, &batch_req, &offset) != 4) {
-            fprintf(stderr, "[hip-daemon] bad line: '%s'\n", line);
-            fflush(stderr);
-            continue;
+        while (len && (line[len-1]=='\n'||line[len-1]=='\r')) line[--len]=0;
+        if (!strncmp(line,"quit",4)) break;
+        unsigned long long sl, sh, batch, offset;
+        if (sscanf(line, "%llu %llu %llu %llu", &sl, &sh, &batch, &offset) != 4) {
+            fprintf(stderr, "[hip-daemon] bad line: '%s'\n", line); continue;
         }
-
-        uint32_t seed_lo       = (uint32_t)sl;
-        uint32_t seed_hi       = (uint32_t)sh;
-        uint64_t index_offset  = (uint64_t)offset;
-        uint32_t batch_per_item = (uint32_t)((batch_req + g.work_items - 1) / g.work_items);
-        uint64_t actual = (uint64_t)g.work_items * batch_per_item;
-
+        uint32_t bpi = (uint32_t)((batch + ctx.work_items - 1) / ctx.work_items);
+        uint64_t actual = (uint64_t)ctx.work_items * bpi;
         double t0 = now_s();
-        BatchResult r = run_dispatch(g, seed_lo, seed_hi, batch_per_item, index_offset);
+        BatchResult r = run_dispatch(ctx, (uint32_t)sl, (uint32_t)sh,
+                                     bpi, (uint64_t)offset);
         double elapsed = now_s() - t0;
-
         printf("{\"best_correct\":%d,\"best_arr\":[", r.best_correct);
         for (int i = 0; i < 25; i++) printf("%s%d", i?",":"", r.best_arr[i]);
         printf("],\"best_index\":%llu,\"total_done\":%llu,\"elapsed\":%.6f,\"rate\":%.0f}\n",
-               (unsigned long long)r.best_index,
-               (unsigned long long)actual,
-               elapsed,
-               elapsed > 0 ? actual / elapsed : 0.0);
+               (unsigned long long)r.best_index, (unsigned long long)actual,
+               elapsed, elapsed > 0 ? actual/elapsed : 0.0);
         fflush(stdout);
     }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────
-
 int main(int argc, char **argv) {
-    bool        daemon_mode    = false;
-    size_t      work_items_flag = 0;
-    int         block_size      = 256;
-    std::vector<std::string> pos_args;
-
-    for (int i = 1; i < argc; i++) {
+    bool   daemon_mode = false;
+    size_t work_items  = 1048576;   // good starting point for 304-CU MI355X
+    int    block_size  = 512;
+    std::vector<std::string> pos;
+    for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if      (a == "--daemon")                    { daemon_mode = true; }
-        else if (a == "--work-items" && i+1 < argc)  { work_items_flag = std::stoull(argv[++i]); }
-        else if (a == "--block-size" && i+1 < argc)  { block_size = std::stoi(argv[++i]); }
-        else if (!a.empty() && a[0] != '-')          { pos_args.push_back(a); }
+        if      (a == "--daemon")                    daemon_mode = true;
+        else if (a == "--work-items" && i+1<argc)    work_items  = std::stoull(argv[++i]);
+        else if (a == "--block-size" && i+1<argc)    block_size  = std::stoi(argv[++i]);
+        else if (!a.empty() && a[0] != '-')          pos.push_back(a);
     }
-
-    uint32_t seed_lo          = pos_args.size() > 0 ? (uint32_t)std::stoull(pos_args[0]) : 0x12345678u;
-    uint32_t seed_hi          = pos_args.size() > 1 ? (uint32_t)std::stoull(pos_args[1]) : 0xdeadbeef;
-    uint64_t total_target     = pos_args.size() > 2 ? std::stoull(pos_args[2])            : 10'000'000ULL;
-    size_t   work_items_pos   = pos_args.size() > 3 ? std::stoull(pos_args[3])            : 0;
-    uint64_t index_offset_pos = pos_args.size() > 4 ? std::stoull(pos_args[4])            : 0;
-
-    // Default work_items: tuned for 7900 XTX (96 CUs × 64 × 4 waves × 4 = 98304 minimum,
-    // use 655360 for deep queuing and hide memory latency)
-    size_t work_items = work_items_flag ? work_items_flag :
-                        work_items_pos  ? work_items_pos  : 655360;
-    // Align to block size
     work_items = ((work_items + block_size - 1) / block_size) * block_size;
 
-    GpuState g;
-    init_gpu(g, work_items, block_size);
+    GpuCtx ctx;
+    init_gpu(ctx, work_items, block_size);
 
-    if (daemon_mode) {
-        daemon_loop(g);
-        destroy_gpu(g);
-        return 0;
-    }
+    if (daemon_mode) { daemon_loop(ctx); return 0; }
 
-    // One-shot mode
-    uint32_t batch_per_item = (uint32_t)((total_target + work_items - 1) / work_items);
-    uint64_t actual_total   = (uint64_t)work_items * batch_per_item;
-    uint64_t index_offset   = index_offset_pos;
-
-    fprintf(stderr, "[hip] work_items=%zu  batch_per_item=%u  total=%llu\n",
-            work_items, batch_per_item, (unsigned long long)actual_total);
-
-    uint64_t shuffles_done = 0, dispatches = 0;
-    int      global_best  = -1;
-    uint8_t  global_arr[25] = {};
-    uint64_t global_index = 0;
-    double   t0 = now_s();
-
-    while (shuffles_done < actual_total) {
-        BatchResult r = run_dispatch(g, seed_lo, seed_hi, batch_per_item, index_offset);
-        if (r.best_correct > global_best) {
-            global_best  = r.best_correct;
-            global_index = r.best_index;
-            memcpy(global_arr, r.best_arr, 25);
-        }
-        uint64_t bt = (uint64_t)work_items * batch_per_item;
-        index_offset  += bt;
-        shuffles_done += bt;
-        dispatches++;
-        if (dispatches % 16 == 0) {
-            double el = now_s() - t0;
-            fprintf(stderr, "\r[hip] %.2fM done  %.0fM/s  best=%d/25   ",
-                    shuffles_done/1e6, shuffles_done/el/1e6, global_best);
-            fflush(stderr);
-        }
-        if (global_best == 25) break;
-    }
-
+    // One-shot benchmark
+    uint32_t seed_lo = pos.size()>0 ? (uint32_t)std::stoull(pos[0]) : 0x12345678u;
+    uint32_t seed_hi = pos.size()>1 ? (uint32_t)std::stoull(pos[1]) : 0xdeadbeef;
+    uint64_t total   = pos.size()>2 ? std::stoull(pos[2]) : 2'000'000'000ULL;
+    uint32_t bpi     = (uint32_t)((total + work_items - 1) / work_items);
+    double t0 = now_s();
+    BatchResult r = run_dispatch(ctx, seed_lo, seed_hi, bpi, 0);
     double elapsed = now_s() - t0;
-    fprintf(stderr, "\n[hip] done. %llu shuffles in %.3fs = %.0fM/s\n",
-            (unsigned long long)shuffles_done, elapsed, shuffles_done/elapsed/1e6);
-
     uint64_t seed64 = ((uint64_t)seed_hi << 32) | seed_lo;
-    printf("{\n");
-    printf("  \"seed\": \"%llu\",\n",     (unsigned long long)seed64);
-    printf("  \"total_done\": %llu,\n",   (unsigned long long)total_target);
-    printf("  \"best_correct\": %d,\n",   global_best);
-    printf("  \"best_index\": %llu,\n",   (unsigned long long)global_index);
-    printf("  \"best_arr\": [");
-    for (int i = 0; i < 25; i++) printf("%s%d", i?",":"", global_arr[i]);
-    printf("],\n");
-    printf("  \"elapsed\": %.6f,\n",      elapsed);
-    printf("  \"rate\": %.0f,\n",         shuffles_done/elapsed);
-    printf("  \"unified_memory\": %s\n",  g.unified ? "true" : "false");
-    printf("}\n");
-
-    destroy_gpu(g);
+    printf("{\n  \"seed\":\"%llu\",\n  \"best_correct\":%d,\n  \"best_index\":%llu,\n  \"best_arr\":[",
+           (unsigned long long)seed64, r.best_correct, (unsigned long long)r.best_index);
+    for (int i = 0; i < 25; i++) printf("%s%d", i?",":"", r.best_arr[i]);
+    printf("],\n  \"elapsed\":%.6f,\n  \"rate\":%.0f\n}\n",
+           elapsed, (uint64_t)work_items * bpi / elapsed);
     return 0;
 }
